@@ -57,9 +57,18 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TokenAddressAndPriceFeedAddressMustBeSameLength();
     error DSCEngine__TokenNotAllowed();
     error DSCEngine__TransferFailed();
+    error DSCEngine__BreaksHealthFactor(uint256 healthFactor);
+    error DSCEngine__MintFailed();
+    
     //////////////////
     ///State Variables    ///
     ////////////////
+
+    uint256 private constant ADDITIONAL_FEED_PREDICTION = 1e10;
+    uint256 private constant PRECISION = 1e18;
+    uint256 private constant LIQUIDATION_THRESHOLD = 50; // 200% overcollateralized;
+    uint256 private constant LIQUIDATION_PRECISON = 100; // 10% penalty for liquidation
+    uint256 private constant MIN_HEALTH_FACTOR = 1;
 
     mapping(address token => address priceFeed) private s_priceFeeds; // tokenToPriceFeed
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -141,7 +150,11 @@ contract DSCEngine is ReentrancyGuard {
      */
     function mintDsc(uint256 amountDscToMint) external moreThanZero(amountDscToMint) nonReentrant {
         s_DSCMinted[msg.sender] += amountDscToMint;
-        revertIfHealthFactorIsBroken(msg.sender);
+        _revertIfHealthFactorIsBroken(msg.sender);
+        bool minted = i_dsc.mint(msg.sender, amountDscToMint);
+        if(!minted) {
+            revert DSCEngine__MintFailed();
+        }
     }
 
     function burnDsc() external {}
@@ -150,12 +163,15 @@ contract DSCEngine is ReentrancyGuard {
 
     function getHealthFactor() external view {}
 
-
     ////////////////////////////////////
     ///Private & Internal View Functions  ///
     ////////////////////////////////////
 
-    function _getAccountInformation(address user) private view returns(uint256 totalDscMinted, uint256 collateralValueInUsd){
+    function _getAccountInformation(address user)
+        private
+        view
+        returns (uint256 totalDscMinted, uint256 collateralValueInUsd)
+    {
         totalDscMinted = s_DSCMinted[user];
         collateralValueInUsd = getAccountCollateralValue(user);
     }
@@ -165,26 +181,44 @@ contract DSCEngine is ReentrancyGuard {
     * If user goes below 1, they are liquidated
     */
     function _healthFactor(address user) private view returns (uint256) {
+        // total DSC minted
+        // total collateral VALUE
         (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
+        uint256 collateralAdjustedForThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISON;
+        // 1000 ETH * 50 = 50,000 / 100 = 500
+        // $150 ETH / 100 DSC = 1.5
+
+        // $1000ETH / 100 DSC
+        // 1000 * 50 - 50000 / 100 = (500 / 100) > 1
+        return (collateralAdjustedForThreshold * PRECISION) / totalDscMinted;
     }
 
-
+    // 1. Check health factor (do they have enough collateral?)
+    // 2. Revert if they don't
     function _revertIfHealthFactorIsBroken(address user) internal view {
-
+        uint256 userHealthFactor = _healthFactor(user);
+        if (userHealthFactor < MIN_HEALTH_FACTOR) {
+            revert DSCEngine__BreaksHealthFactor(userHealthFactor);
+        }
     }
 
     //////////////////////////////////////////
     ///Public & External View Functions  ///
     ////////////////////////////////////////
-    function getAccountCollateralValue(address user) public view returns(uint256) {
-        for(uint256 i = 0; i < s_collateralTokens.length; i++){
+    function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValueInUsd) {
+        for (uint256 i = 0; i < s_collateralTokens.length; i++) {
             address token = s_collateralTokens[i];
             uint256 amount = s_collateralDeposited[user][token];
-            totalCollateralValue += 
+            totalCollateralValueInUsd += getUsdValue(token, amount);
         }
+        return totalCollateralValueInUsd;
     }
 
-    function getUsdValue(address token, uint256 amount) public view returns(uint256){
-
+    function getUsdValue(address token, uint256 amount) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        // 1 ETH = $1000
+        // The returned value from CL will be 1000 * 1e8
+        return ((uint256(price) * ADDITIONAL_FEED_PREDICTION) * amount) / PRECISION;
     }
 }
